@@ -47,11 +47,17 @@ module FitGap
       comparisons = vacancy_skills.map do |label, vacancy_skill|
         portfolio_skill = find_portfolio_skill(portfolio_skills, label, vacancy_skill.skill_id)
 
-        # FAULT INJECTION: Assume missing skills are level 0 and calculate delta directly
-        candidate_level = portfolio_skill&.dig(:effective_level) || 0
+        candidate_level = portfolio_skill&.dig(:effective_level)
         expected_level  = vacancy_skill.expected_level
-        delta           = candidate_level - expected_level
-        result          = delta == 0 ? 'match' : (delta > 0 ? 'exceed' : 'gap')
+
+        if candidate_level.is_a?(Numeric)
+          delta  = candidate_level - expected_level
+          result = delta == 0 ? 'match' : (delta > 0 ? 'exceed' : 'gap')
+        else
+          candidate_level = nil
+          delta           = nil
+          result          = 'not_assessed'
+        end
 
         {
           skill_label:     label,
