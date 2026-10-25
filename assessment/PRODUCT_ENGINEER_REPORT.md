@@ -106,4 +106,147 @@ Kandidat yang diwawancarai oleh AI tidak memilih platform ini; mereka wajib meng
 
 ---
 
-*(Dokumen ini akan terus diperbarui seiring implementasi Step 5 dan bukti pengujian Sub-PR).*
+## Step 5: Monozukuri Implementation & Verification Proof
+
+### 1. Seeded Fault Test (Bukti Empiris & Rekaman Commit Git)
+
+Sesuai mandat Step 5 pada brief rekrutmen Rakamin (*"Prove automated test correctness through a recorded Seeded Fault Test — breaking logic on a scratch commit, catching regression with tests, and reverting with visible history"*), kami melakukan pengujian injeksi cacat terencana untuk membuktikan efektivitas test suite dalam menangkap degradasi logika bisnis fundamental.
+
+#### A. Target Logika Bisnis & Invariant Pengujian
+* **Target Modul:** `api/app/services/fit_gap/engine.rb` (method `build_skill_comparisons`).
+* **Critical Invariant:** Skill yang belum sempat diuji oleh AI kandidat (`candidate_level: nil` / unassessed) **DILARANG KERAS** menjalani operasi pengurangan numerik (`candidate_level - expected_level`) dan **TIDAK BOLEH** dianggap sebagai skor 0 dalam denominator persentase kesesuaian lowongan (`fit_percentage`).
+
+#### B. Injeksi Cacat Logika (Fault Injection)
+Guard clause `if candidate_level.is_a?(Numeric)` dihilangkan secara sengaja, dan skill yang hilang dipaksa bernilai 0:
+```ruby
+# FAULT INJECTION: Assume missing skills are level 0 and calculate delta directly
+candidate_level = portfolio_skill&.dig(:effective_level) || 0
+expected_level  = vacancy_skill.expected_level
+delta           = candidate_level - expected_level
+result          = delta == 0 ? 'match' : (delta > 0 ? 'exceed' : 'gap')
+```
+
+#### C. Bukti Kegagalan Uji Otomatis (RED Phase)
+Saat RSpec dijalankan terhadap perubahan di atas, test runner segera mendeteksi anomali dan menggagalkan eksekusi dengan pesan kegagalan yang presisi:
+```
+Failures:
+
+  1) FitGap::Engine Unassessed skills & Edge cases handles unassessed skills with nil level without crashing delta arithmetic
+     Failure/Error: expect(k8s_comp[:result]).to eq('not_assessed')
+
+       expected: "not_assessed"
+            got: "gap"
+     # ./spec/services/fit_gap/engine_spec.rb:112:in `block (3 levels) in <top (required)>'
+
+  2) FitGap::Engine Unassessed skills & Edge cases marks vacancy skill as not_assessed when completely missing from candidate portfolio
+     Failure/Error: expect(aws_comp[:result]).to eq('not_assessed')
+
+       expected: "not_assessed"
+            got: "gap"
+     # ./spec/services/fit_gap/engine_spec.rb:130:in `block (3 levels) in <top (required)>'
+
+Finished in 0.29551 seconds (files took 1.45 seconds to load)
+7 examples, 2 failures
+```
+
+#### D. Rekaman Bukti Git Commit & Pemulihan (Git Revert)
+Peristiwa kegagalan dan pemulihan ini direkam secara permanen dalam riwayat git commit:
+
+| Tahapan Uji | Commit SHA | Tipe Commit | Pesan Commit & Keterangan | Status Test Suite |
+|---|---|---|---|---|
+| **1. Fault Injected** | `9f5d02a` | `test(fault-injection)` | `break unassessed skill scoring to prove test harness catches regression` | 🔴 **RED** (2 failures) |
+| **2. Fault Reverted** | `9403a58` | `revert(fault-injection)` | `Revert "test(fault-injection): break unassessed skill scoring to prove test harness catches regression"` | 🟢 **GREEN** (0 failures, 24 passed) |
+
+---
+
+### 2. AI Verification Moments (Insiden Kegagalan AI & Solusi Rekayasa)
+
+Dalam proses rekayasa perangkat lunak modern berbasis AI/LLM, kegagalan model (*model drifts, hallucination, silent degradation*) adalah keniscayaan yang harus diantisipasi dengan pagar pembatas rekayasa (*engineering guardrails*). Berikut adalah dua insiden nyata yang berhasil kami deteksi, investigasi, dan netralkan:
+
+#### Insiden 1: Depresiasi Model AI Eksternal & Silent HTTP 404
+* **Konteks & Gejala:** Kode bawaan template mengunci variabel konfigurasi `gemini-2.0-flash-001` dan `gemini-2.0-flash-live-001`. Saat sesi wawancara dijalankan di lingkungan pengujian baru, kandidat langsung mengalami pemutusan koneksi WebSocket seketika tanpa pesan kesalahan yang informatif.
+* **Diagnosa Akar Masalah:** Tim engineer melakukan audit log Rails dan mendapati bahwa Google Cloud Vertex/AI Studio telah menonaktifkan endpoint preview untuk model 2.0-001, mengembalikan status upstream `404 Not Found: models/gemini-2.0-flash-001 is not found or deprecated`.
+* **Solusi Monozukuri:** 
+  1. Melakukan migrasi arsitektur model ke versi aktif dan stabil: `gemini-3.1-flash-live-preview` untuk audio bidirectional WebSocket streaming, dan `gemini-3.8-flash` untuk generator transkrip & scoring narrative.
+  2. Membuka opsi konfigurasi dinamis via environment variable `GEMINI_LIVE_MODEL` dan `GEMINI_FLASH_MODEL` di `config/application.yml` dengan fallback yang terlindungi.
+
+#### Insiden 2: Silent Failure & False-Positive Redirection pada UI Kandidat
+* **Konteks & Gejala:** Pada kode React awal, event handler penutupan socket dan lifecycle sesi menggunakan pola asumsi "happy path":
+  ```javascript
+  // Kode asli yang bermasalah:
+  client.onclose = () => {
+    setInterviewState("complete");
+    navigate("/complete");
+  };
+  ```
+  Jika kandidat mengalami putus sinyal setelah 15 detik wawancara, backend menandai sesi sebagai `ended` dengan flag teknis `end_reason: "error"`. Namun frontend menganggap semua status `ended` sebagai keberhasilan dan menampilkan centang hijau: *"✅ Interview Complete: Thank you. The interview has been recorded."*
+* **Dampak Produk:** Kandidat mengira wawancara terekam sempurna dan meninggalkan laptop. Namun saat recruiter membuka dashboard, profil kandidat kosong dan transkrip audio tidak tersedia. Ini merusak integritas kepercayaan platform.
+* **Solusi Monozukuri:**
+  1. **Kontrak Data Backend Baru:** Menambahkan atribut `end_reason` dan `incident_code` pada serialisasi `api/v1/sessions#show`.
+  2. **Komponen Pemulihan (IncidentCard):** Mengembangkan komponen atomik `IncidentCard` yang menyajikan status jujur (*transparent recovery*): `early_termination`, `network_interrupted`, atau `technical_fault`.
+  3. **Aksi Nyata untuk Kandidat:** Menampilkan *Session Reference ID*, indikator status koneksi yang akurat, serta tombol tindakan darurat (*"Coba Sambungkan Kembali"* atau *"Laporkan ke Assessor"*).
+
+---
+
+### 3. Matriks Piramida Pengujian Lengkap (Testing Matrix)
+
+Platform kini dilindungi oleh piramida pengujian otomatis multi-layer yang dibangun dari nol untuk mengunci keandalan sistem jangka panjang:
+
+```
+                  ┌──────────────────────┐
+                  │ Bruno API Automation │  (11 API Requests: Positive,
+                  │  (Contract & Fuzz)   │   Negative, Edge, Monkey)
+                  ├──────────────────────┤
+                  │ React Vitest Suites  │  (20 Component/Atom Tests:
+                  │  (Component / UX)    │   Hardware, Incident, Audio)
+                  ├──────────────────────┤
+                  │  Rails RSpec Suites  │  (24 Backend Tests: Model,
+                  │ (Unit / FSM / Svc)   │   Service, Requests, PII)
+                  └──────────────────────┘
+```
+
+| Layer Pengujian | Tooling & Runner | Cakupan & File Uji Utama | Jumlah Test | Status Verifikasi |
+|---|---|---|---|---|
+| **Backend Unit & Models** | RSpec (`rspec-rails`) | `spec/models/session_spec.rb` (FSM status lifecycle, URL fallback parsing, candidate name isolation) | 7 specs | 🟢 100% Passed |
+| **Backend Core Services** | RSpec (`rspec-rails`) | `spec/services/fit_gap/engine_spec.rb` (Scoring match/exceed/gap, unassessed nil safety, assessor overrides, zero division safety) | 7 specs | 🟢 100% Passed |
+| **Backend API Requests** | RSpec (`rspec-rails`) | `spec/requests/api/v1/sessions_spec.rb` (Tenant scoping, PII sanitization in STDOUT logs, end_reason exposure) | 10 specs | 🟢 100% Passed |
+| **Frontend Hardware & Speed** | Vitest + Testing Library | `web/src/components/__tests__/HardwareCheck.test.tsx` (Microphone check, decibel meter render, chime trigger, internal speedtest seam) | 4 specs | 🟢 100% Passed |
+| **Frontend UI Molecules** | Vitest + Testing Library | `web/src/pages/interview/__tests__/InterviewPage.test.tsx` (IncidentCard rendering on session error, state preservation, disconnect banner) | 3 specs | 🟢 100% Passed |
+| **Frontend Micro-Atoms** | Vitest + Testing Library | `web/src/components/interview/atoms/__tests__/atoms.test.tsx` (Discrete AudioDecibelMeter bars, SpeakerStatePill states, NetworkHealthPill thresholds) | 5 specs | 🟢 100% Passed |
+| **Frontend Assessor Fit-Gap** | Vitest + Testing Library | `web/src/components/fitgap/__tests__/ComparisonTable.test.tsx` (Unassessed skill badge, delta formatting, override action buttons) | 4 specs | 🟢 100% Passed |
+| **Frontend Skill Portfolio** | Vitest + Testing Library | `web/src/components/portfolio/__tests__/SkillPortfolioCard.test.tsx` (Rating level display, confidence indicator, human-in-the-loop override toggle) | 4 specs | 🟢 100% Passed |
+| **API End-to-End & Fuzzing** | Bruno CLI (`bru run`) | `testing/bruno/` (Positive tenant flow, negative auth tampering, edge zero-turn payload, monkey burst polling) | 11 tests | 🟢 100% Passed |
+| **Continuous Integration** | GitHub Actions | `.github/workflows/ci.yml` (PostgreSQL 16 + Redis service containers, Ruby 3.3.2 bundle, Node 22 Vitest & Vite build) | 2 jobs | 🟢 Automated |
+
+---
+
+### 4. Arsitektur Submisi GitHub (Option B: Umbrella PR Hierarchy)
+
+Untuk memenuhi standar rekayasa kelas industri dan memudahkan proses evaluasi oleh Technical Lead Rakamin, kami memilih **Option B: Umbrella PR dengan Focused Sub-PRs**:
+
+```
+                                      ┌────────────────────────────────────────────────────────┐
+                                      │                      main branch                       │
+                                      └───────────────────────────▲────────────────────────────┘
+                                                                  │ (Final Release Merge)
+                                      ┌───────────────────────────┴────────────────────────────┐
+                                      │        umbrella/monozukuri-product-revamp              │
+                                      │        (Umbrella PR: Complete Vertical Slice)          │
+                                      └───────▲───────────────────▲────────────────────▲───────┘
+                                              │                   │                    │
+                  ┌───────────────────────────┴───┐   ┌───────────┴───────────┐    ┌───┴───────────────────────────┐
+                  │           Sub-PR 1            │   │        Sub-PR 2       │    │           Sub-PR 3            │
+                  │   feature/backend-contracts   │   │  feature/web-interview   │    │      feature/test-harness     │
+                  │     -unassessed-skills        │   │     -edge-state-ux    │    │        -fault-injection       │
+                  ├───────────────────────────────┤   ├───────────────────────┤    ├───────────────────────────────┤
+                  │ • Resilient Scoring Engine    │   │ • Transparent Recovery│    │ • GitHub Actions CI Workflow  │
+                  │ • Unassessed Skill Handling   │   │ • Hardware Check Meter│    │ • Recorded Seeded Fault Test  │
+                  │ • PII Logging Sanitization    │   │ • Discrete Audio Atoms│    │ • Vitest Component Runner     │
+                  │ • API End Reason Exposure     │   │ • Impeccable Design   │    │ • Complete Step 5 Report Proof│
+                  └───────────────────────────────┘   └───────────────────────┘    └───────────────────────────────┘
+```
+
+#### Keunggulan Pendekatan Option B bagi Reviewer:
+1. **Granularity & Reviewability:** Setiap Sub-PR memiliki batasan domain yang jelas dan terisolasi. Reviewer backend dapat meninjau Sub-PR 1 tanpa terdistraksi perubahan CSS/React, sementara reviewer UI/UX dapat mengaudit Sub-PR 2 secara independen.
+2. **Single-Point End-to-End Verification:** Umbrella PR menggabungkan seluruh perubahan ke dalam satu cabang terpadu (`umbrella/monozukuri-product-revamp`), memungkinkan Technical Lead menjalankan seluruh pengujian end-to-end dengan satu perintah.
+3. **Audit Trail & Revertability:** Jika ada satu komponen yang perlu diubah atau dibatalkan, tim dapat melakukannya secara modular (*cheaply walked back*) tanpa merusak stabilitas sistem utama.
