@@ -19,12 +19,21 @@ module Portfolios
         candidate_id:      @session.candidate_id,
         generation_status: 'pending'
       )
-
       portfolio.update!(generation_status: 'generating')
+
+      if @session.transcript_turns.empty?
+        portfolio.portfolio_skills.destroy_all
+        portfolio.update!(
+          generation_status: 'complete',
+          generated_at: Time.current,
+          generation_error: 'Sesi diakhiri sebelum wawancara dimulai (tidak ada transkrip rekaman).'
+        )
+        Rails.logger.info("[N10] Portfolio completed (empty turns fallback) for session #{@session.id}")
+        return portfolio
+      end
 
       prompt   = build_prompt
       response = @gemini_client.generate_content(prompt, temperature: 0.2)
-
       save_skills(portfolio, response)
       portfolio.update!(generation_status: 'complete', generated_at: Time.current)
 
