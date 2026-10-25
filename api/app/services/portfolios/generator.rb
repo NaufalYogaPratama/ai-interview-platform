@@ -8,7 +8,7 @@ module Portfolios
     def initialize(session:, gemini_client: nil)
       @session = session
       @gemini_client = gemini_client || Gemini::HttpClient.new(
-        model:   ENV.fetch('GEMINI_PRO_MODEL', 'gemini-2.0-pro-001'),
+        model:   ENV.fetch('GEMINI_PRO_MODEL', 'gemini-3.8-flash'),
         timeout: 180  # up to 3 minutes for large transcripts
       )
     end
@@ -154,26 +154,32 @@ module Portfolios
       portfolio.portfolio_skills.destroy_all
 
       (data['configured_skills'] || []).each do |skill_data|
+        raw_level = skill_data['level']
+        next if raw_level.blank? || raw_level.to_s.strip =~ /^(0|n\/?a|none|unassessed|not_assessed)$/i || raw_level.to_i < 1
+
         portfolio.portfolio_skills.create!(
           skill_id:           skill_data['skill_id'],
           skill_label:        skill_data['skill_label'],
           is_discovered:      false,
-          ai_level:           skill_data['level'].to_i.clamp(1, 5),
-          ai_confidence:      skill_data['confidence'],
+          ai_level:           raw_level.to_i.clamp(1, 5),
+          ai_confidence:      skill_data['confidence'] || 'low',
           evidence:           Array(skill_data['evidence']).first(3),
-          competency_summary: skill_data['competency_summary']
+          competency_summary: skill_data['competency_summary'] || 'Assessed competency.'
         )
       end
 
       (data['discovered_skills'] || []).each do |skill_data|
+        raw_level = skill_data['level']
+        next if raw_level.blank? || raw_level.to_s.strip =~ /^(0|n\/?a|none|unassessed|not_assessed)$/i || raw_level.to_i < 1
+
         portfolio.portfolio_skills.create!(
           skill_id:           nil,
           skill_label:        skill_data['skill_label'],
           is_discovered:      true,
-          ai_level:           skill_data['level'].to_i.clamp(1, 5),
-          ai_confidence:      skill_data['confidence'],
+          ai_level:           raw_level.to_i.clamp(1, 5),
+          ai_confidence:      skill_data['confidence'] || 'low',
           evidence:           Array(skill_data['evidence']).first(3),
-          competency_summary: skill_data['competency_summary']
+          competency_summary: skill_data['competency_summary'] || 'Discovered skill competency.'
         )
       end
     end
